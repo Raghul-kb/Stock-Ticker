@@ -20,6 +20,9 @@ st.set_page_config(
     layout="wide"
 )
 
+# ---------------------------------------------------------------------------
+# Basic styling
+# ---------------------------------------------------------------------------
 st.markdown(
     """
     <style>
@@ -48,6 +51,9 @@ st.markdown(
 
 st.title("📈 Stock Ticker Research Platform")
 
+# ---------------------------------------------------------------------------
+# Session state setup
+# ---------------------------------------------------------------------------
 if "research_data" not in st.session_state:
     st.session_state.research_data = None
 if "recommendation_data" not in st.session_state:
@@ -55,6 +61,9 @@ if "recommendation_data" not in st.session_state:
 if "pdf_path" not in st.session_state:
     st.session_state.pdf_path = None
 
+# ---------------------------------------------------------------------------
+# Input section
+# ---------------------------------------------------------------------------
 col1, col2 = st.columns([3, 1])
 with col1:
     ticker_input = st.text_input("Enter Stock Ticker Symbol", placeholder="e.g. AAPL, MSFT, TSLA").strip().upper()
@@ -78,7 +87,7 @@ if generate_clicked:
                 recommendation_data = recommendation_agent.run(research_data)
                 st.session_state.recommendation_data = recommendation_data
 
-            st.session_state.pdf_path = None
+            st.session_state.pdf_path = None  # reset previous PDF
             st.success(f"Report generated for {ticker_input}")
 
         except DataFetchError as e:
@@ -90,6 +99,9 @@ if generate_clicked:
             st.session_state.research_data = None
             st.session_state.recommendation_data = None
 
+# ---------------------------------------------------------------------------
+# Results display
+# ---------------------------------------------------------------------------
 research_data = st.session_state.research_data
 recommendation_data = st.session_state.recommendation_data
 
@@ -103,6 +115,7 @@ if research_data and recommendation_data:
     st.header(f"{stock_info.get('company_name', research_data['ticker'])} ({research_data['ticker']})")
     st.caption(f"Sector: {stock_info.get('sector', 'N/A')}  |  Industry: {stock_info.get('industry', 'N/A')}")
 
+    # --- Metrics Section ---
     st.subheader("📊 Key Metrics")
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Current Price", f"${stock_info.get('current_price', 'N/A')}")
@@ -116,6 +129,7 @@ if research_data and recommendation_data:
 
     st.divider()
 
+    # --- Technical Analysis Section ---
     st.subheader("📉 Technical Analysis")
     t1, t2, t3, t4 = st.columns(4)
     t1.metric("RSI (14)", technicals.get("rsi", "N/A"))
@@ -127,8 +141,46 @@ if research_data and recommendation_data:
         trend = "🟢 Bullish (MA50 > MA200)" if technicals["ma50"] > technicals["ma200"] else "🔴 Bearish (MA50 < MA200)"
         st.info(f"**Trend Signal:** {trend}")
 
+    # --- Price Chart with Moving Averages ---
+    st.markdown("##### Price Chart (1 Year)")
+    history = research_data.get("history")
+
+    if history is None or history.empty:
+        st.warning("No price history available to chart.")
+    else:
+        try:
+            chart_df = history[["Close", "Volume"]].copy()
+            chart_df["MA50"] = chart_df["Close"].rolling(window=50).mean()
+            chart_df["MA200"] = chart_df["Close"].rolling(window=200).mean()
+
+            # Streamlit's chart renderer can silently render blank charts with
+            # a timezone-aware DatetimeIndex (common with yfinance data).
+            # Stripping the timezone and resetting to a plain Date column fixes it.
+            chart_df = chart_df.reset_index()
+            date_col = chart_df.columns[0]  # usually "Date" or "Datetime"
+            chart_df[date_col] = pd.to_datetime(chart_df[date_col]).dt.tz_localize(None)
+            chart_df = chart_df.set_index(date_col)
+
+            price_cols = chart_df[["Close", "MA50", "MA200"]].dropna(how="all")
+
+            if price_cols.empty or price_cols["Close"].dropna().empty:
+                st.warning("Price history was returned but contained no usable values to chart.")
+            else:
+                st.line_chart(price_cols, height=400, use_container_width=True)
+                st.caption("Close price with 50-day and 200-day moving averages overlaid.")
+
+                with st.expander("View Volume"):
+                    st.bar_chart(chart_df[["Volume"]], height=200, use_container_width=True)
+
+                with st.expander("View Raw Price Data"):
+                    st.dataframe(chart_df.tail(30), use_container_width=True)
+
+        except Exception as chart_error:
+            st.error(f"⚠️ Could not render price chart: {str(chart_error)}")
+
     st.divider()
 
+    # --- News & Sentiment Section ---
     st.subheader("📰 News & Sentiment")
     s1, s2, s3, s4 = st.columns(4)
     s1.metric("Positive", sentiment.get("positive_count", 0))
@@ -160,6 +212,7 @@ if research_data and recommendation_data:
 
     st.divider()
 
+    # --- Recommendation Section ---
     st.subheader("🤖 AI Recommendation")
     rec = recommendation_data.get("recommendation", "HOLD")
     badge_class = {"BUY": "rec-buy", "SELL": "rec-sell", "HOLD": "rec-hold"}.get(rec, "rec-hold")
@@ -176,6 +229,7 @@ if research_data and recommendation_data:
 
     st.divider()
 
+    # --- PDF Export ---
     st.subheader("📄 Export Report")
     if st.button("Generate PDF Report"):
         try:
