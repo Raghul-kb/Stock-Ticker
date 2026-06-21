@@ -5,6 +5,7 @@ fetching news, and calculating a simple sentiment score.
 """
 
 import os
+import time
 import requests
 import pandas as pd
 import numpy as np
@@ -16,6 +17,28 @@ load_dotenv()
 
 NEWS_API_KEY = os.getenv("NEWS_API_KEY")
 NEWS_API_URL = "https://newsapi.org/v2/everything"
+
+# ---------------------------------------------------------------------------
+# Yahoo Finance frequently blocks/rate-limits requests that look like a
+# generic Python script. Using curl_cffi to impersonate a real browser's
+# TLS fingerprint is the most reliable current workaround. We build one
+# session and reuse it across calls. If curl_cffi isn't installed, we
+# silently fall back to yfinance's default behavior.
+# ---------------------------------------------------------------------------
+_YF_SESSION = None
+
+
+def _get_yf_session():
+    global _YF_SESSION
+    if _YF_SESSION is not None:
+        return _YF_SESSION
+    try:
+        from curl_cffi import requests as cffi_requests
+        _YF_SESSION = cffi_requests.Session(impersonate="chrome")
+    except Exception:
+        _YF_SESSION = None
+    return _YF_SESSION
+
 
 # ---------------------------------------------------------------------------
 # Simple keyword lists used for naive sentiment scoring of news headlines.
@@ -45,86 +68,107 @@ class DataFetchError(Exception):
     pass
 
 
-def fetch_stock_info(ticker: str) -> dict:
+def fetch_stock_info(ticker: str, max_retries: int = 3, retry_delay: float = 2.0) -> dict:
     """
     Fetch core stock information using yFinance.
 
-    Yahoo Finance's underlying endpoints occasionally rate-limit or return
-    an empty/non-JSON body, which makes `Ticker.info` raise a JSON decode
-    error. This function fetches price history first (most reliable call),
-    then tries `.info` and falls back to `.fast_info` / history-derived
-    values if `.info` fails, so the app keeps working even when the
-    metadata endpoint is flaky.
+    Yahoo Finance's endpoints frequently rate-limit or block requests that
+    look like a plain Python script, and/or occasionally return an empty
+    or non-JSON body. To handle this robustly we:
+      1. Use a curl_cffi session that impersonates a real browser when
+         available (falls back to default yfinance behavior otherwise).
+      2. Retry a few times with a short delay on transient failures.
+      3. Fetch price history first (most reliable call), then try the
+         richer `.info` metadata endpoint and fall back to `.fast_info` /
+         history-derived values if `.info` fails.
     """
     ticker = ticker.strip().upper()
+    session = _get_yf_session()
 
-    try:
-        stock = yf.Ticker(ticker)
-    except Exception as e:
-        raise DataFetchError(f"Failed to initialize ticker '{ticker}': {str(e)}")
+    last_error = None
 
-    # --- Step 1: price history (used for current price + technical indicators) ---
-    try:
-        history = stock.history(period="1y")
-    except Exception as e:
-        raise DataFetchError(f"Failed to fetch price history for '{ticker}': {str(e)}")
-
-    if history is None or history.empty:
-        raise DataFetchError(
-            f"No data found for ticker '{ticker}'. Please check the symbol is correct "
-            f"(e.g. 'AAPL', 'MSFT'). If the symbol is correct, Yahoo Finance may be "
-            f"temporarily rate-limiting requests - wait a moment and try again."
-        )
-
-    # --- Step 2: try the rich metadata endpoint (.info), but don't fail hard ---
-    info = {}
-    try:
-        info = stock.info or {}
-    except Exception:
-        info = {}
-
-    # --- Step 3: fallback to fast_info if .info came back empty/broken ---
-    fast_info = {}
-    if not info:
+    for attempt in range(1, max_retries + 1):
         try:
-            fast_info = dict(stock.fast_info) if stock.fast_info else {}
-        except Exception:
+            stock = yf.Ticker(ticker, session=session) if session else yf.Ticker(ticker)
+
+            history = stock.history(period="1y")
+
+            if history is None or history.empty:
+                last_error = DataFetchError(
+                    f"No data found for ticker '{ticker}'. Please check the symbol is correct "
+                    f"(e.g. 'AAPL', 'MSFT')."
+                )
+                if attempt < max_retries:
+                    time.sleep(retry_delay)
+                    continue
+                raise last_error
+
+            # --- try the rich metadata endpoint (.info), but don't fail hard ---
+            info = {}
+            try:
+                info = stock.info or {}
+            except Exception:
+                info = {}
+
+            # --- fallback to fast_info if .info came back empty/broken ---
             fast_info = {}
+            if not info:
+                try:
+                    fast_info = dict(stock.fast_info) if stock.fast_info else {}
+                except Exception:
+                    fast_info = {}
 
-    def _get(*keys, default=None):
-        """Try each key against info, then fast_info, then return default."""
-        for source in (info, fast_info):
-            for key in keys:
-                if source and key in source and source[key] is not None:
-                    return source[key]
-        return default
+            def _get(*keys, default=None):
+                for source in (info, fast_info):
+                    for key in keys:
+                        if source and key in source and source[key] is not None:
+                            return source[key]
+                return default
 
-    current_price = _get("currentPrice", "regularMarketPrice", "lastPrice", "last_price")
-    if current_price is None:
-        current_price = float(history["Close"].iloc[-1])
+            current_price = _get("currentPrice", "regularMarketPrice", "lastPrice", "last_price")
+            if current_price is None:
+                current_price = float(history["Close"].iloc[-1])
 
-    fifty_two_week_high = _get("fiftyTwoWeekHigh", "year_high")
-    if fifty_two_week_high is None:
-        fifty_two_week_high = round(float(history["High"].max()), 2)
+            fifty_two_week_high = _get("fiftyTwoWeekHigh", "year_high")
+            if fifty_two_week_high is None:
+                fifty_two_week_high = round(float(history["High"].max()), 2)
 
-    fifty_two_week_low = _get("fiftyTwoWeekLow", "year_low")
-    if fifty_two_week_low is None:
-        fifty_two_week_low = round(float(history["Low"].min()), 2)
+            fifty_two_week_low = _get("fiftyTwoWeekLow", "year_low")
+            if fifty_two_week_low is None:
+                fifty_two_week_low = round(float(history["Low"].min()), 2)
 
-    data = {
-        "ticker": ticker,
-        "company_name": _get("longName", "shortName", default=ticker),
-        "current_price": round(float(current_price), 2) if current_price is not None else None,
-        "market_cap": _get("marketCap", "market_cap"),
-        "pe_ratio": _get("trailingPE"),
-        "dividend_yield": _get("dividendYield"),
-        "fifty_two_week_high": fifty_two_week_high,
-        "fifty_two_week_low": fifty_two_week_low,
-        "sector": _get("sector", default="N/A"),
-        "industry": _get("industry", default="N/A"),
-        "history": history
-    }
-    return data
+            data = {
+                "ticker": ticker,
+                "company_name": _get("longName", "shortName", default=ticker),
+                "current_price": round(float(current_price), 2) if current_price is not None else None,
+                "market_cap": _get("marketCap", "market_cap"),
+                "pe_ratio": _get("trailingPE"),
+                "dividend_yield": _get("dividendYield"),
+                "fifty_two_week_high": fifty_two_week_high,
+                "fifty_two_week_low": fifty_two_week_low,
+                "sector": _get("sector", default="N/A"),
+                "industry": _get("industry", default="N/A"),
+                "history": history
+            }
+            return data
+
+        except DataFetchError as e:
+            last_error = e
+            if attempt < max_retries:
+                time.sleep(retry_delay)
+                continue
+            raise
+
+        except Exception as e:
+            last_error = DataFetchError(f"Failed to fetch stock info for '{ticker}': {str(e)}")
+            if attempt < max_retries:
+                time.sleep(retry_delay)
+                continue
+            raise last_error
+
+    # Should not normally reach here, but guard just in case
+    raise last_error or DataFetchError(f"Failed to fetch stock info for '{ticker}'.")
+
 
 def calculate_technical_indicators(history: pd.DataFrame) -> dict:
     """
