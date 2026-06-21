@@ -28,27 +28,35 @@ GROQ_MODEL = "llama-3.3-70b-versatile"
 class ResearchAgent:
     """
     Agent 1: Research Agent
-    Collects raw stock data, computes technical indicators, fetches news,
-    and calculates sentiment. Returns a structured dict for the next agent.
+    Responsible for collecting raw stock data, computing technical
+    indicators, fetching relevant news, and calculating sentiment.
+    Returns a single structured dictionary consumed by the
+    RecommendationAgent.
     """
 
     def __init__(self, ticker: str):
         self.ticker = ticker.strip().upper()
 
     def run(self) -> dict:
+        """Execute the full research pipeline and return structured data."""
         if not self.ticker:
             raise DataFetchError("Ticker symbol cannot be empty.")
 
+        # Step 1: Stock info
         stock_info = fetch_stock_info(self.ticker)
         history = stock_info.pop("history")
 
+        # Step 2: Technical indicators
         technicals = calculate_technical_indicators(history)
 
+        # Step 3: News
         try:
             news_list = fetch_news(self.ticker, stock_info.get("company_name", ""))
         except DataFetchError:
+            # News failures shouldn't crash the whole pipeline; fall back to empty list
             news_list = []
 
+        # Step 4: Sentiment
         sentiment = calculate_sentiment(news_list)
 
         structured_data = {
@@ -56,7 +64,8 @@ class ResearchAgent:
             "stock_info": stock_info,
             "technicals": technicals,
             "news": news_list,
-            "sentiment": sentiment
+            "sentiment": sentiment,
+            "history": history
         }
         return structured_data
 
@@ -64,8 +73,10 @@ class ResearchAgent:
 class RecommendationAgent:
     """
     Agent 2: Recommendation Agent
-    Applies rule-based BUY/SELL/HOLD logic, then asks Groq's
-    llama-3.3-70b-versatile for confidence score, sentiment label, rationale.
+    Consumes the structured output of ResearchAgent, applies a rule-based
+    BUY/SELL/HOLD check, and asks the Groq LLM (llama-3.3-70b-versatile)
+    to produce a confidence score, market sentiment label, and a short
+    rationale grounded in the provided data.
     """
 
     def __init__(self):
@@ -76,6 +87,8 @@ class RecommendationAgent:
     @staticmethod
     def rule_based_signal(technicals: dict, sentiment: dict) -> str:
         """
+        Apply the simple deterministic recommendation logic:
+
         BUY:  RSI < 70  AND MA50 > MA200 AND Sentiment Score > 60
         SELL: RSI > 75  AND MA50 < MA200
         Otherwise: HOLD
@@ -85,6 +98,7 @@ class RecommendationAgent:
         ma200 = technicals.get("ma200")
         sentiment_score = sentiment.get("sentiment_score")
 
+        # If we don't have enough data to evaluate the rules, default to HOLD
         if rsi is None or ma50 is None or ma200 is None or sentiment_score is None:
             return "HOLD"
 
@@ -99,7 +113,7 @@ class RecommendationAgent:
         stock_info = research_data["stock_info"]
         technicals = research_data["technicals"]
         sentiment = research_data["sentiment"]
-        news = research_data["news"][:5]
+        news = research_data["news"][:5]  # limit to top 5 headlines for prompt size
 
         news_summary = "\n".join(
             [f"- {n['title']} ({n['source']})" for n in news if n.get("title")]
@@ -151,6 +165,11 @@ Respond ONLY with a valid JSON object (no markdown, no commentary) in this exact
         return prompt
 
     def run(self, research_data: dict) -> dict:
+        """
+        Generate the final recommendation by combining the rule-based
+        signal with an LLM-generated confidence score, sentiment label,
+        and rationale.
+        """
         technicals = research_data["technicals"]
         sentiment = research_data["sentiment"]
 
@@ -169,6 +188,7 @@ Respond ONLY with a valid JSON object (no markdown, no commentary) in this exact
             )
             raw_text = response.choices[0].message.content.strip()
 
+            # Clean up potential markdown code fences
             cleaned = raw_text.replace("```json", "").replace("```", "").strip()
             llm_result = json.loads(cleaned)
 
@@ -186,6 +206,7 @@ Respond ONLY with a valid JSON object (no markdown, no commentary) in this exact
             return result
 
         except (json.JSONDecodeError, KeyError, IndexError, AttributeError) as e:
+            # Fallback: if the LLM response can't be parsed, use rule-based signal
             return {
                 "recommendation": rule_signal,
                 "confidence_score": 50,
